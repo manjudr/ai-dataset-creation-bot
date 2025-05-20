@@ -2,6 +2,11 @@ import json
 import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
+from infra_response_handler import query_kubectl_ai_async
+from kubectl_ai import query_kubectl_ai
+from prom import generate_prometheus_query, query_prometheus, run_query_pipeline, summarize_result
+from summary import generate_summary
+
 # Load model configuration
 with open("config.json", "r") as config_file:
     CONFIG = json.load(config_file)
@@ -105,13 +110,20 @@ async def get_ai_response_stream(user_input, context, websocket: WebSocket, mode
            - If `data_location` not in context:
              - Ask:
                _"Where is your data located? (e.g., Kafka, Cloud Storage, API, Neo4j, Cassandra etc.)"_
+                - If user provides a location, store it in the context.
+                - If user says "I don't know", say:
+                _"That's okay! I can help you with that. Could you describe how you plan to access the data?"_
+                - If the user already provided in the history, use that instead.
+                - If the user says some other location which is not in this list kafka, cloud storage, api, neo4j, cassandra, say:
+                _"I can help you with that. We need to implement a new connector to pull the data and for more details on how to implement a connector please refer to this documentation http://docs.obsrv.ai"_
+                - If the user already provided in the history, use that instead.
 
         3. Storage Recommendation
             - If `storage_option` is not yet in context:
                 - Ask the user:
                 - "Can you tell me how this dataset will be used? For example, will it require frequent updates and corrections, or is it mostly used for read-heavy analytics and reporting?"
                 - Analyze the user’s response **semantically**, and decide based on intent:
-                - If the intent indicates the dataset will evolve over time, involves corrections, change data capture, or historical snapshots:
+                - If the intent indicates the dataset will evolve over time, involves corrections, change data capture, or historical snapshots or transactional storage or updates: 
                     - Recommend Apache Hudi:
                     - "Apache Hudi is suitable for datasets that require updates, corrections, and time-travel queries. It integrates with Spark/Flink and is efficient for managing mutable data in batch or streaming jobs."
                     - confirm with the user:
@@ -121,10 +133,14 @@ async def get_ai_response_stream(user_input, context, websocket: WebSocket, mode
                     - "Apache Druid is built for real-time ingestion and fast analytical queries on large, mostly immutable datasets. It's ideal for powering dashboards and high-performance analytics use cases."
                     - confirm with the user:
                     _"Would you like to proceed with Apache Druid for your dataset?"_
-
-                - If the user says something generic like “what do you suggest”:
-                - Review prior inputs (e.g., `dataset_purpose`, `data_location`) and synthesize a recommendation with rationale.
                 - If the user provides a specific storage option, confirm and set it in the context.
+                - If the user says something generic like "what do you suggest":
+                    - Review prior inputs (e.g., `dataset_purpose`, `data_location`) and synthesize a recommendation with rationale.
+                    - If the user provides a specific storage option, confirm and set it in the context.
+                - If the user says "I don't know" or not sure, say:
+                    _"That's okay! I can help you with that. Could you describe how this dataset will be used? For example, will it require frequent updates and corrections, or is it mostly used for read-heavy analytics and reporting?"_
+                - If the user provides a specific storage option, confirm and set it in the context.
+                - If the user says positively, set `storage_option` in the context.
                     
         
         4. **Dataset Name Suggestions**
@@ -138,6 +154,10 @@ async def get_ai_response_stream(user_input, context, websocket: WebSocket, mode
                     - dataset_name_3
                 - Which one would you like to use, or would you prefer to provide a custom name?"_
             - If the user selects or provides a name, store it in the context without missing it.
+            - If the user says something generic like "what do you suggest" or they don't know:
+                - Generate three dataset name suggestions based on the dataset purpose.
+                - Review prior inputs (e.g., `dataset_purpose`, `data_location`) and synthesize a recommendation with rationale.
+                - If the user provides a specific dataset name, confirm and set it in the context.
              
         5. **Sample Data**
            - Only if purpose and data location are available.
@@ -165,6 +185,7 @@ async def get_ai_response_stream(user_input, context, websocket: WebSocket, mode
                             {{\"field\": \"property_name\", \"treatment\": \"encryption\"}}
                         ]
                         ```
+                    - Suggest why it's important to handle PII data properly.    
                     _"Based on your sample event, I found the following possible PII fields: ['property_name', 'property_name']. How would you like me to handle each of them? You can choose from the following options:  
                     - **Mask**: Replace the value with a masked version.  
                     - **Encrypt**: Encrypt the value for privacy.  
@@ -175,9 +196,19 @@ async def get_ai_response_stream(user_input, context, websocket: WebSocket, mode
             6.2. Suggest Deduplication Key
             - If `dedup_key` is not in context:
             - Understand the user requirement ask are there any deduplication requirements and tell why it's important.
-            - Suggest a deduplication field based on the sample (e.g., `uuid`, `event_id`).
+            - Explain the importance of deduplication in data processing and analytics.
+            - Analyze `sample_event` to identify potential deduplication fields (e.g., `message_id`, `id`, `uuid`).
+            - Present the identified deduplication fields to the user, asking them to confirm or provide a different field.
+            - For example:
+                ```json
+                \"dedup_key\": \"message_id\"
+                ```
             - Ask:
-                _"Suggested deduplication key: `'uuid'`. Should I use this to remove duplicates?"_
+                _"I found these possible deduplication fields in your sample: ['message_id', 'id', 'uuid']. Which one should I use for deduplication?"_
+            - If the user provides a field, confirm and set `dedup_key` in the context.
+            - If the user says something generic like "what do you suggest":
+                - Review prior inputs (e.g., `dataset_purpose`, `data_location`) and synthesize a recommendation with rationale.
+                - If the user provides a specific deduplication key, confirm and set it in the context.
 
             6.3. Suggest Timestamp Key
             - If `timestamp_key` is not in context:
@@ -193,6 +224,7 @@ async def get_ai_response_stream(user_input, context, websocket: WebSocket, mode
                     - Say: "I found these possible timestamp fields in your sample: `timestamp`, `created_at`, `due_date`. Which one should I use for event-time processing?"
                     - If user replies with a valid field name, confirm and set `timestamp_key` in the context
                     - If user replies with a generic agreement like "yes", default to the top suggestion and confirm
+                    - Suggest why it's important to have a timestamp key based on the storage_option selected.
             
         7. **Dynamic Modifications**
            - If user asks to change or update any field, acknowledge and update context.
@@ -411,14 +443,58 @@ async def websocket_endpoint(websocket: WebSocket):
             try:
                 json_data = json.loads(data)
                 print(f"[websocket] Parsed JSON: {json_data}")
-
+                assistance_type = json_data.get("assistanceType")
                 user_message = json_data.get("message", "").strip()
                 if not user_message:
                     await websocket.send_text(json.dumps({"error": "Empty message received"}))
                     continue
 
                 context = connected_clients.get(websocket, {"history": []})
-                await get_ai_response_stream(user_message, context, websocket)
+                if assistance_type == "dataset":
+                    # Call the dataset-specific function
+                    await get_ai_response_stream(user_message, context, websocket)
+
+                if assistance_type == "prometheus":
+                    # Call the kubectl AI service for infrastructure assistance
+                    promql_query = generate_prometheus_query(user_message)
+                    await websocket.send_text(json.dumps({
+                        "message": f"🧠 Generated PromQL Query: {promql_query}",
+                        "context": context
+                    }))
+
+                    try:
+                        prom_result = query_prometheus(promql_query)
+                        if not prom_result:
+                            await websocket.send_text(json.dumps({
+                                "message": "No results were retrieved from Prometheus.",
+                                "context": context
+                            }))
+                        else:
+                            await websocket.send_text(json.dumps({
+                                "message": f"📊 Raw Result from Prometheus: {prom_result}",
+                                "context": context
+                            }))
+
+                            summary = summarize_result(user_message, promql_query, prom_result)
+                            await websocket.send_text(json.dumps({
+                                "message": f"🗣️ Summary: {summary}",
+                                "context": context
+                            }))
+                    except Exception as e:
+                        await websocket.send_text(json.dumps({
+                            "message": "No results were retrieved from Prometheus.",
+                            "context": context
+                        }))
+
+                if assistance_type == "infra":
+                    # Call the kubectl AI service for other assistance types
+                    response = query_kubectl_ai(user_message)  # Synchronous call
+                    #kube_summary = generate_summary(response)
+                    #print(f"[websocket] Sending response: {kube_summary}")
+                    await websocket.send_text(json.dumps({
+                        "message": response,
+                        "context": context
+                    }))
                 connected_clients[websocket] = context
 
             except json.JSONDecodeError as e:
